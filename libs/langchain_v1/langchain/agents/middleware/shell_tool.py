@@ -55,6 +55,8 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 _DONE_MARKER_PREFIX = "__LC_SHELL_DONE__"
+# Marks the end of the command's own output, so the harness can cut its trailer off exactly.
+_OUTPUT_END_SENTINEL = "__LC_SHELL_OUTPUT_END__"
 
 DEFAULT_TOOL_DESCRIPTION = (
     "Execute a shell command inside a persistent session. Before running a command, "
@@ -215,12 +217,27 @@ class ShellSession:
             self._process = None
 
     def execute(self, command: str, *, timeout: float) -> CommandExecutionResult:
-        """Execute a command in the persistent shell."""
+        """Execute a command in the persistent shell.
+
+        The completion marker is written on ITS OWN LINE, separated from the command's output by a
+        sentinel that names where the output ends. Without this, a command whose final line has no
+        trailing newline leaves the marker appended to that line, `_collect_output`'s
+        `data.startswith(marker)` never matches, and the call burns the entire timeout while reporting
+        `output=""` and `exit_code=None` even though every child process has already exited.
+
+        The sentinel exists because the two problems must be solved together. Prepending a bare newline
+        fixes the match but adds a byte to EVERY command's output, which silently changes every
+        observation this harness records. Emitting the sentinel lets the trailer be cut at a known
+        point, so ordinary output is returned byte-for-byte as before while unterminated output
+        becomes readable instead of empty.
+        """
         if not self._process or self._process.poll() is not None:
             msg = "Shell session is not running."
             raise RuntimeError(msg)
 
         marker = f"{_DONE_MARKER_PREFIX}{uuid.uuid4().hex}"
+        # Per-command, so a command that somehow echoes it back cannot produce a false trailer.
+        sentinel = f"{_OUTPUT_END_SENTINEL}{uuid.uuid4().hex}"
         deadline = time.monotonic() + timeout
 
         with self._lock:
@@ -228,14 +245,53 @@ class ShellSession:
             payload = command if command.endswith("\n") else f"{command}\n"
             try:
                 self._stdin.write(payload)
-                self._stdin.write(f"printf '{marker} %s\\n' $?\n")
+                # Leading newline terminates any unterminated final output line; the sentinel then
+                # occupies a line of its own; `$?` is captured once for the sentinel line and once for
+                # the marker line, so the exit status survives the extra printf.
+                self._stdin.write(f"printf '\\n{sentinel}%s\\n{marker} %s\\n' $? $?\n")
                 self._stdin.flush()
             except (BrokenPipeError, OSError):
                 # The shell exited before we could write the marker command.
                 # This happens when commands like 'exit 1' terminate the shell.
                 return self._collect_output_after_exit(deadline)
 
-            return self._collect_output(marker, deadline, timeout)
+            result = self._collect_output(marker, deadline, timeout)
+
+        return self._strip_marker_trailer(result, sentinel)
+
+    @staticmethod
+    def _strip_marker_trailer(
+        result: CommandExecutionResult, sentinel: str
+    ) -> CommandExecutionResult:
+        """Overview: cut the harness's own trailer off `result.output`, leaving the command's bytes.
+
+        Everything from the sentinel onward is ours, not the command's: the newline we injected, the
+        sentinel line and the marker line. Cutting there is exact rather than heuristic -- it needs no
+        guess about whether the command ended with a newline, which is what makes it safe for output
+        that legitimately ends in a blank line, for output truncated by the line/byte caps, and for
+        commands producing nothing at all.
+
+        A missing sentinel means the output did not come from the path we instrumented (a timed-out
+        call, or a shell that died before printing it); the result is returned untouched rather than
+        edited on a guess.
+        """
+        if result.timed_out or not result.output:
+            return result
+        index = result.output.rfind(sentinel)
+        if index < 0:
+            return result
+        stripped = result.output[:index]
+        if stripped.endswith("\n"):
+            stripped = stripped[:-1]
+        return CommandExecutionResult(
+            output=stripped,
+            exit_code=result.exit_code,
+            timed_out=result.timed_out,
+            truncated_by_lines=result.truncated_by_lines,
+            truncated_by_bytes=result.truncated_by_bytes,
+            total_lines=result.total_lines,
+            total_bytes=result.total_bytes,
+        )
 
     def _collect_output(
         self,

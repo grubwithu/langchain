@@ -21,7 +21,9 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
-version = "1.3.14"
+# LOCAL FORK: PEP 440 local version so an installed environment names this build rather than
+# claiming to be stock 1.3.14. SyncFuzz pins `==1.3.14` upstream; this fork is consumed by git ref.
+version = "1.3.14+syncfuzz.1"
 requires-python = ">=3.10.0,<4.0.0"
 dependencies = [
     "langchain-core>=1.4.9,<2.0.0",
